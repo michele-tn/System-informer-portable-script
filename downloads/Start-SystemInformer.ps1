@@ -1,26 +1,32 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-Find, verify, extract and run the latest stable System Informer as administrator.
+Find, verify, extract and run Stable or Canary System Informer as administrator.
 .DESCRIPTION
-Queries the official SourceForge file list on every run. Keeps the original ZIP,
+Queries SourceForge for Stable or the official Canary page for previews. Keeps the original ZIP,
 uses versioned portable directories and never installs the setup package.
 Requires Windows and Internet access. Launch mode also requires UAC approval.
+.PARAMETER Channel
+Stable (default), Canary, or Nightly (alias for Canary).
 .PARAMETER Destination
 Portable workspace. Defaults to the directory containing this script.
 .PARAMETER NoLaunch
 Prepare the portable application without starting it.
 .PARAMETER CheckOnly
-Report the latest stable release and expected SHA-256 without downloading.
+Report the selected release and expected SHA-256 without downloading.
 .EXAMPLE
 .\Start-SystemInformer.ps1
 .EXAMPLE
 .\Start-SystemInformer.ps1 -Destination 'D:\Portable Tools\SystemInformer' -NoLaunch
 .EXAMPLE
 .\Start-SystemInformer.ps1 -CheckOnly
+.EXAMPLE
+.\Start-SystemInformer.ps1 -Channel Canary -NoLaunch
 #>
 [CmdletBinding(DefaultParameterSetName = 'Launch')]
 param(
+    [ValidateSet('Stable', 'Canary', 'Nightly')]
+    [string]$Channel = 'Stable',
     [ValidateNotNullOrEmpty()]
     [string]$Destination = $PSScriptRoot,
     [Parameter(Mandatory = $true, ParameterSetName = 'Prepare')]
@@ -73,9 +79,32 @@ function Get-LatestStableRelease {
     }
 }
 
+function Get-LatestCanaryRelease {
+    Write-Host '[1/5] Checking the latest Canary portable ZIP...'
+    $page = Invoke-WebRequest -Uri 'https://systeminformer.com/canary' -UseBasicParsing -TimeoutSec 60 -MaximumRedirection 10
+    $link = [regex]::Match($page.Content, 'href="(?<url>https://github\.com/winsiderss/si-builds/releases/download/(?<version>\d+\.\d+\.\d+\.\d+)/systeminformer-build-bin\.zip)"', 'IgnoreCase')
+    $hash = [regex]::Match($page.Content, 'Binaries\s*<small[^>]*>\(SHA-256\)[\s\S]*?href="https://www\.virustotal\.com/gui/file/(?<hash>[a-fA-F0-9]{64})"', 'IgnoreCase')
+    if (-not $link.Success -or -not $hash.Success) {
+        throw 'The official Canary page did not publish a recognizable portable ZIP and SHA-256.'
+    }
+    [pscustomobject]@{
+        Version = $link.Groups['version'].Value
+        FileName = "systeminformer-$($link.Groups['version'].Value)-canary-bin.zip"
+        Sha256 = $hash.Groups['hash'].Value.ToLowerInvariant()
+        PageUrl = $link.Groups['url'].Value
+    }
+}
+
+function Get-ArchiveSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+
 function Receive-VerifiedArchive($Release, [string]$ArchivePath) {
     if (Test-Path -LiteralPath $ArchivePath -PathType Leaf) {
-        if ((Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash -eq $Release.Sha256) {
+        if ((Get-ArchiveSha256 $ArchivePath) -eq $Release.Sha256) {
             Write-Host '[2/5] Reusing the existing ZIP: SHA-256 verified.'
             return
         }
@@ -85,9 +114,12 @@ function Receive-VerifiedArchive($Release, [string]$ArchivePath) {
     $url = $Release.PageUrl
     try {
         for ($attempt = 1; $attempt -le 6; $attempt++) {
-            Assert-SourceForgeUrl $url
+            if ($Channel -eq 'Stable') { Assert-SourceForgeUrl $url }
+            elseif ($url -notmatch '^https://github\.com/winsiderss/si-builds/releases/download/\d+\.\d+\.\d+\.\d+/systeminformer-build-bin\.zip$') {
+                throw "Rejected an unexpected Canary download URL: $url"
+            }
             Invoke-WebRequest -Uri $url -OutFile $partial -UseBasicParsing -TimeoutSec 180 -MaximumRedirection 10
-            if ((Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash -eq $Release.Sha256) {
+            if ((Get-ArchiveSha256 $partial) -eq $Release.Sha256) {
                 Move-Item -LiteralPath $partial -Destination $ArchivePath -Force
                 Write-Host 'Download complete: SHA-256 verified.'
                 return
@@ -95,6 +127,7 @@ function Receive-VerifiedArchive($Release, [string]$ArchivePath) {
             if ((Get-Item -LiteralPath $partial).Length -gt 2MB) {
                 throw 'The downloaded archive failed SHA-256 verification. The previous ZIP was preserved.'
             }
+            if ($Channel -ne 'Stable') { throw 'The Canary archive failed SHA-256 verification.' }
             # SourceForge sometimes sends an HTML refresh rather than an HTTP redirect.
             $html = Get-Content -LiteralPath $partial -Raw
             $refresh = [regex]::Match($html, 'content\s*=\s*"\d+;\s*url=([^"]+)"', 'IgnoreCase')
@@ -126,6 +159,7 @@ function Expand-VerifiedArchive([string]$ArchivePath, [string]$Target) {
 }
 
 try {
+    if ($Channel -eq 'Nightly') { $Channel = 'Canary' }
     if ($env:OS -ne 'Windows_NT') { throw 'This script requires Windows.' }
     if (-not $PSCommandPath) { throw 'Save this script as a .ps1 file before running it.' }
     if (-not $CheckOnly) {
@@ -136,7 +170,7 @@ try {
         # Encode an expression to preserve paths with spaces and apostrophes.
         $scriptLiteral = $PSCommandPath.Replace("'", "''")
         $destinationLiteral = $Destination.Replace("'", "''")
-        $command = "& '$scriptLiteral' -Destination '$destinationLiteral'"
+        $command = "& '$scriptLiteral' -Destination '$destinationLiteral' -Channel '$Channel'"
         if ($NoLaunch) { $command += ' -NoLaunch' }
         if ($CheckOnly) { $command += ' -CheckOnly' }
         $command += '; exit $LASTEXITCODE'
@@ -148,8 +182,8 @@ try {
         exit $child.ExitCode
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $release = Get-LatestStableRelease
-    Write-Host "Latest stable version: $($release.Version)"
+    $release = if ($Channel -eq 'Stable') { Get-LatestStableRelease } else { Get-LatestCanaryRelease }
+    Write-Host "Latest $Channel version: $($release.Version)"
     Write-Host "Expected SHA-256: $($release.Sha256)"
     if ($CheckOnly) { $release | Format-List; exit 0 }
 
@@ -167,7 +201,8 @@ try {
         catch { throw 'Another run is using this directory, or it is not writable. Close the other run and retry.' }
         $archivePath = Join-Path $Destination $release.FileName
         Receive-VerifiedArchive $release $archivePath
-        $versionFolder = Join-Path $Destination "SystemInformer-$($release.Version)"
+        $folderName = if ($Channel -eq 'Stable') { "SystemInformer-$($release.Version)" } else { "SystemInformer-Canary-$($release.Version)" }
+        $versionFolder = Join-Path $Destination $folderName
         $exe = Join-Path $versionFolder "$binaryFolder\SystemInformer.exe"
         $marker = Join-Path $versionFolder '.archive-sha256'
         $prepared = (Test-Path -LiteralPath $exe -PathType Leaf) -and (Test-Path -LiteralPath $marker -PathType Leaf)
@@ -185,11 +220,12 @@ try {
         $settings = "$exe.settings.json"
         if (-not (Test-Path -LiteralPath $settings)) { [IO.File]::WriteAllText($settings, '{}') }
         $manifest = [ordered]@{
-            Version = $release.Version; Architecture = $architecture; Sha256 = $release.Sha256
-            Archive = $release.FileName; Executable = "SystemInformer-$($release.Version)/$binaryFolder/SystemInformer.exe"
+            Channel = $Channel; Version = $release.Version; Architecture = $architecture; Sha256 = $release.Sha256
+            Archive = $release.FileName; Executable = "$folderName/$binaryFolder/SystemInformer.exe"
             Source = $release.PageUrl; CheckedUtc = [DateTime]::UtcNow.ToString('o')
         }
-        $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Destination 'latest-release.json') -Encoding UTF8
+        $manifestName = if ($Channel -eq 'Stable') { 'latest-release.json' } else { 'latest-canary-release.json' }
+        $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Destination $manifestName) -Encoding UTF8
         Write-Host "ZIP retained: $archivePath"
         Write-Host "Portable executable: $exe"
         if ($NoLaunch) { Write-Host '[5/5] Ready. Application launch was skipped (-NoLaunch).' }
